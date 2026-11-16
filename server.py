@@ -22,8 +22,8 @@ app.add_middleware(
 # RUTA LOCAL DENTRO DEL SERVIDOR RENDER (Sin bloqueos de red ni firewalls)
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PATH_RESOLUCIONES = os.path.join(BASE_DIR, "Reporte Temas Subtemas Analizados.xlsx")
-PATH_TESAUROS = os.path.join(BASE_DIR, "TESAURO-LABORAL.xlsx")
+PATH_RESOLUCIONES = os.path.join(BASE_DIR, "/datos/Reporte Temas Subtemas Analizados.xlsx")
+PATH_TESAUROS = os.path.join(BASE_DIR, "/datos/TESAURO-LABORAL.xlsx")
 
 
 def cargar_resoluciones_local(ruta: str) -> pd.DataFrame:

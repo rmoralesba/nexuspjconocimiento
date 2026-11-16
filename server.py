@@ -1,4 +1,5 @@
 import os
+import traceback
 import pandas as pd
 from typing import Optional
 from fastapi import FastAPI, Query
@@ -7,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(
     title="Nexus-BOT API & MCP Server",
     description="Servidor de herramientas y consulta jurisprudencial independiente",
-    version="1.4.0"
+    version="1.5.0"
 )
 
 app.add_middleware(
@@ -18,26 +19,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==============================================================================
-# RUTA EXACTA EN TU REPOSITORIO DE GITHUB
-# ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PATH_RESOLUCIONES = os.path.join(BASE_DIR, "datos", "Reporte Temas Subtemas Analizados.xlsx")
 PATH_TESAUROS = os.path.join(BASE_DIR, "datos", "TESAURO-LABORAL.xlsx")
 
+ERROR_CARGA = None
+
 
 def cargar_resoluciones_local(ruta: str) -> pd.DataFrame:
-    """Lee el archivo Excel alojado en datos/ optimizando el uso de memoria."""
+    """Lee la primera hoja del Excel de resoluciones de forma segura."""
+    global ERROR_CARGA
     if not os.path.exists(ruta):
+        ERROR_CARGA = f"El archivo no existe en la ruta: {ruta}"
         return pd.DataFrame()
     
     try:
-        # Se lee la hoja principal de datos
-        df = pd.read_excel(
-            ruta,
-            sheet_name="ReporteTemasSubtemasAnalizados",
-            engine="openpyxl"
-        )
+        # sheet_name=0 lee siempre la primera pestaña del libro sin importar su nombre
+        df = pd.read_excel(ruta, sheet_name=0, engine="openpyxl")
         df = df.fillna("")
 
         mapeo_columnas = {}
@@ -62,9 +60,16 @@ def cargar_resoluciones_local(ruta: str) -> pd.DataFrame:
             elif "expediente" in col_limpia:
                 mapeo_columnas[col] = "no_expediente"
 
-        return df.rename(columns=mapeo_columnas)
+        df = df.rename(columns=mapeo_columnas)
+        
+        # Conservar únicamente las columnas útiles para ahorrar memoria RAM en Render
+        columnas_utiles = [c for c in ["abogado", "tema", "subtema", "numero_voto", "fecha_voto", "despacho", "no_expediente"] if c in df.columns]
+        if columnas_utiles:
+            df = df[columnas_utiles]
+            
+        return df
     except Exception as e:
-        print(f"Error leyendo Excel local: {e}")
+        ERROR_CARGA = f"Error al leer Excel: {str(e)}"
         return pd.DataFrame()
 
 
@@ -72,12 +77,11 @@ def cargar_tesauros_local(ruta: str) -> pd.DataFrame:
     if not os.path.exists(ruta):
         return pd.DataFrame()
     try:
-        return pd.read_excel(ruta, engine="openpyxl").fillna("")
+        return pd.read_excel(ruta, sheet_name=0, engine="openpyxl").fillna("")
     except Exception:
         return pd.DataFrame()
 
 
-# Carga en memoria al encender el servidor
 df_resoluciones = cargar_resoluciones_local(PATH_RESOLUCIONES)
 df_tesauros = cargar_tesauros_local(PATH_TESAUROS)
 
@@ -87,8 +91,9 @@ def inicio():
     return {
         "servicio": "Nexus-BOT Knowledge Server",
         "estado": "En línea y operativo",
-        "ruta_buscada": PATH_RESOLUCIONES,
-        "archivo_encontrado": os.path.exists(PATH_RESOLUCIONES),
+        "archivo_existe": os.path.exists(PATH_RESOLUCIONES),
+        "error_carga": ERROR_CARGA,
+        "columnas_detectadas": list(df_resoluciones.columns),
         "registros_cargados": {
             "resoluciones": len(df_resoluciones),
             "tesauros": len(df_tesauros)
@@ -102,45 +107,50 @@ def buscar_jurisprudencia(
     despacho: Optional[str] = Query(None, description="Filtrar por despacho judicial"),
     limite: int = Query(5, description="Cantidad máxima de resoluciones a devolver")
 ):
-    if df_resoluciones.empty:
+    try:
+        if df_resoluciones.empty:
+            return {
+                "total_encontrados": 0,
+                "resultados": [],
+                "detalle_error": ERROR_CARGA or "La tabla de resoluciones está vacía."
+            }
+
+        termino_norm = termino.lower().strip()
+        resultados = []
+
+        # Búsqueda fila por fila optimizada (evita duplicar memoria en Render)
+        for _, fila in df_resoluciones.iterrows():
+            texto_fila = " ".join(str(val) for val in fila.values).lower()
+            
+            if termino_norm in texto_fila:
+                despacho_val = str(fila.get("despacho", "N/D"))
+                if despacho and despacho.lower().strip() not in despacho_val.lower():
+                    continue
+                    
+                resultados.append({
+                    "numero_voto": str(fila.get("numero_voto", "N/D")),
+                    "numero_expediente": str(fila.get("no_expediente", "N/D")),
+                    "fecha_voto": str(fila.get("fecha_voto", "N/D")),
+                    "despacho": despacho_val,
+                    "abogado": str(fila.get("abogado", "N/D")),
+                    "tema": str(fila.get("tema", "N/D")),
+                    "subtema": str(fila.get("subtema", "N/D"))
+                })
+                
+                if len(resultados) >= limite:
+                    break
+
         return {
-            "total_encontrados": 0,
-            "resultados": [],
-            "aviso": f"No se pudo cargar el archivo en: {PATH_RESOLUCIONES}"
+            "termino_buscado": termino,
+            "despacho_filtrado": despacho,
+            "total_encontrados": len(resultados),
+            "resultados": resultados
         }
-
-    termino_norm = termino.lower().strip()
-    resultados = []
-
-    mask = pd.Series(False, index=df_resoluciones.index)
-    campos_busqueda = ["tema", "subtema", "abogado", "numero_voto", "despacho", "no_expediente"]
-
-    for campo in campos_busqueda:
-        if campo in df_resoluciones.columns:
-            mask = mask | df_resoluciones[campo].astype(str).str.lower().str.contains(termino_norm, regex=False)
-
-    if despacho and "despacho" in df_resoluciones.columns:
-        mask = mask & df_resoluciones["despacho"].astype(str).str.lower().str.contains(despacho.lower().strip(), regex=False)
-
-    coincidencias = df_resoluciones[mask].head(limite)
-
-    for _, fila in coincidencias.iterrows():
-        resultados.append({
-            "numero_voto": str(fila.get("numero_voto", "N/D")),
-            "numero_expediente": str(fila.get("no_expediente", "N/D")),
-            "fecha_voto": str(fila.get("fecha_voto", "N/D")),
-            "despacho": str(fila.get("despacho", "N/D")),
-            "abogado": str(fila.get("abogado", "N/D")),
-            "tema": str(fila.get("tema", "N/D")),
-            "subtema": str(fila.get("subtema", "N/D"))
-        })
-
-    return {
-        "termino_buscado": termino,
-        "despacho_filtrado": despacho,
-        "total_encontrados": len(resultados),
-        "resultados": resultados
-    }
+    except Exception as e:
+        return {
+            "error_ejecucion": str(e),
+            "traza": traceback.format_exc().splitlines()[-3:]
+        }
 
 
 @app.get("/api/consultar-tesauro", tags=["Herramientas Jurisprudenciales"])

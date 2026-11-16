@@ -31,7 +31,7 @@ app.add_middleware(
 BASE_URL_BI = "https://cij.poder-judicial.go.cr/files/BI/"
 
 URL_RESOLUCIONES = f"{BASE_URL_BI}Reporte%20Temas%20Subtemas%20Analizados.xlsx"
-URL_TESAUROS = f"{BASE_URL_BI}tesauros.xlsx"
+URL_TESAUROS = f"{BASE_URL_BI}TESAURO-LABORAL.xlsx"
 
 
 def descargar_y_leer_excel(url: str) -> pd.DataFrame:

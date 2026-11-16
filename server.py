@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(
     title="Nexus-BOT API & MCP Server",
     description="Servidor de herramientas y consulta jurisprudencial independiente",
-    version="1.3.0"
+    version="1.4.0"
 )
 
 app.add_middleware(
@@ -19,21 +19,25 @@ app.add_middleware(
 )
 
 # ==============================================================================
-# RUTA LOCAL DENTRO DEL SERVIDOR RENDER (Sin bloqueos de red ni firewalls)
+# RUTA EXACTA EN TU REPOSITORIO DE GITHUB
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PATH_RESOLUCIONES = os.path.join(BASE_DIR, "datos/Reporte Temas Subtemas Analizados.xlsx")
-PATH_TESAUROS = os.path.join(BASE_DIR, "datos/TESAURO-LABORAL.xlsx")
+PATH_RESOLUCIONES = os.path.join(BASE_DIR, "datos", "Reporte Temas Subtemas Analizados.xlsx")
+PATH_TESAUROS = os.path.join(BASE_DIR, "datos", "TESAURO-LABORAL.xlsx")
 
 
 def cargar_resoluciones_local(ruta: str) -> pd.DataFrame:
-    """Lee el archivo Excel alojado directamente en el repositorio."""
+    """Lee el archivo Excel alojado en datos/ optimizando el uso de memoria."""
     if not os.path.exists(ruta):
         return pd.DataFrame()
     
     try:
-        # Se leen únicamente las columnas necesarias para optimizar memoria en Render
-        df = pd.read_excel(ruta, engine="openpyxl")
+        # Se lee la hoja principal de datos
+        df = pd.read_excel(
+            ruta,
+            sheet_name="ReporteTemasSubtemasAnalizados",
+            engine="openpyxl"
+        )
         df = df.fillna("")
 
         mapeo_columnas = {}
@@ -81,8 +85,9 @@ df_tesauros = cargar_tesauros_local(PATH_TESAUROS)
 @app.get("/", tags=["Estado"])
 def inicio():
     return {
-        "servicio": "Nexus-BOT Knowledge Server (Local Storage)",
+        "servicio": "Nexus-BOT Knowledge Server",
         "estado": "En línea y operativo",
+        "ruta_buscada": PATH_RESOLUCIONES,
         "archivo_encontrado": os.path.exists(PATH_RESOLUCIONES),
         "registros_cargados": {
             "resoluciones": len(df_resoluciones),
@@ -101,7 +106,7 @@ def buscar_jurisprudencia(
         return {
             "total_encontrados": 0,
             "resultados": [],
-            "aviso": "No se encontró el archivo de 'resoluciones.xlsx' junto a server.py en el repositorio."
+            "aviso": f"No se pudo cargar el archivo en: {PATH_RESOLUCIONES}"
         }
 
     termino_norm = termino.lower().strip()
@@ -143,7 +148,7 @@ def consultar_tesauro(
     concepto: str = Query(..., description="Concepto o figura jurídica a normalizar")
 ):
     if df_tesauros.empty:
-        return {"coincidencias": [{"mensaje": "No se encontró el archivo 'tesauros.xlsx' en el repositorio."}]}
+        return {"coincidencias": [{"mensaje": "No se encontró el archivo 'datos/tesauros.xlsx' en el repositorio."}]}
 
     concepto_norm = concepto.lower().strip()
     coincidencias = []

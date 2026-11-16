@@ -1,19 +1,13 @@
 import os
-import io
-import urllib3
-import requests
 import pandas as pd
 from typing import Optional
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# Desactivar advertencias de certificados SSL institucionales
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 app = FastAPI(
     title="Nexus-BOT API & MCP Server",
     description="Servidor de herramientas y consulta jurisprudencial independiente",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 app.add_middleware(
@@ -25,78 +19,71 @@ app.add_middleware(
 )
 
 # ==============================================================================
-# CONFIGURACIÓN DE RUTAS HTTPS EN EL SERVIDOR INSTITUCIONAL
-# Verifica que el nombre del archivo coincida exactamente con el subido a /files/BI/
+# RUTA LOCAL DENTRO DEL SERVIDOR RENDER (Sin bloqueos de red ni firewalls)
 # ==============================================================================
-BASE_URL_BI = "https://cij.poder-judicial.go.cr/files/BI/"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PATH_RESOLUCIONES = os.path.join(BASE_DIR, "Reporte Temas Subtemas Analizados.xlsx")
+PATH_TESAUROS = os.path.join(BASE_DIR, "TESAURO-LABORAL.xlsx")
 
-URL_RESOLUCIONES = f"{BASE_URL_BI}Reporte Temas Subtemas Analizados.xlsx"
-URL_TESAUROS = f"{BASE_URL_BI}TESAURO-LABORAL.xlsx"
 
-
-def descargar_y_leer_excel(url: str) -> pd.DataFrame:
-    """Descarga el archivo Excel desde cij.poder-judicial.go.cr simulando un navegador estándar."""
+def cargar_resoluciones_local(ruta: str) -> pd.DataFrame:
+    """Lee el archivo Excel alojado directamente en el repositorio."""
+    if not os.path.exists(ruta):
+        return pd.DataFrame()
+    
     try:
-        cabeceras = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        # verify=False evita errores si el servidor institucional usa una CA intermedia no estándar
-        respuesta = requests.get(url, headers=cabeceras, timeout=45, verify=False)
-        respuesta.raise_for_status()
-        
-        archivo_memoria = io.BytesIO(respuesta.content)
-        # engine="openpyxl" lee el archivo de forma eficiente
-        df = pd.read_excel(archivo_memoria, engine="openpyxl")
-        return df.fillna("")
+        # Se leen únicamente las columnas necesarias para optimizar memoria en Render
+        df = pd.read_excel(ruta, engine="openpyxl")
+        df = df.fillna("")
+
+        mapeo_columnas = {}
+        for col in df.columns:
+            col_limpia = (
+                str(col).strip().lower()
+                .replace("á", "a").replace("é", "e")
+                .replace("í", "i").replace("ó", "o").replace("ú", "u")
+            )
+            if "abogado" in col_limpia:
+                mapeo_columnas[col] = "abogado"
+            elif "tema" in col_limpia and "sub" not in col_limpia:
+                mapeo_columnas[col] = "tema"
+            elif "subtema" in col_limpia:
+                mapeo_columnas[col] = "subtema"
+            elif "voto" in col_limpia or "resolucion" in col_limpia or "sentencia" in col_limpia:
+                mapeo_columnas[col] = "numero_voto"
+            elif "fecha" in col_limpia:
+                mapeo_columnas[col] = "fecha_voto"
+            elif "despacho" in col_limpia:
+                mapeo_columnas[col] = "despacho"
+            elif "expediente" in col_limpia:
+                mapeo_columnas[col] = "no_expediente"
+
+        return df.rename(columns=mapeo_columnas)
     except Exception as e:
-        print(f"Error al descargar desde {url}: {e}")
+        print(f"Error leyendo Excel local: {e}")
         return pd.DataFrame()
 
 
-def cargar_resoluciones_desde_url(url: str) -> pd.DataFrame:
-    """Descarga y estandariza las columnas del Excel de resoluciones."""
-    df = descargar_y_leer_excel(url)
-    if df.empty:
-        return df
-
-    mapeo_columnas = {}
-    for col in df.columns:
-        col_limpia = (
-            str(col).strip().lower()
-            .replace("á", "a").replace("é", "e")
-            .replace("í", "i").replace("ó", "o").replace("ú", "u")
-        )
-        
-        if "abogado" in col_limpia:
-            mapeo_columnas[col] = "abogado"
-        elif "tema" in col_limpia and "sub" not in col_limpia:
-            mapeo_columnas[col] = "tema"
-        elif "subtema" in col_limpia:
-            mapeo_columnas[col] = "subtema"
-        elif "voto" in col_limpia or "resolucion" in col_limpia or "sentencia" in col_limpia:
-            mapeo_columnas[col] = "numero_voto"
-        elif "fecha" in col_limpia:
-            mapeo_columnas[col] = "fecha_voto"
-        elif "despacho" in col_limpia:
-            mapeo_columnas[col] = "despacho"
-        elif "expediente" in col_limpia:
-            mapeo_columnas[col] = "no_expediente"
-            
-    return df.rename(columns=mapeo_columnas)
+def cargar_tesauros_local(ruta: str) -> pd.DataFrame:
+    if not os.path.exists(ruta):
+        return pd.DataFrame()
+    try:
+        return pd.read_excel(ruta, engine="openpyxl").fillna("")
+    except Exception:
+        return pd.DataFrame()
 
 
-# Carga inicial en memoria al encender el servidor
-df_resoluciones = cargar_resoluciones_desde_url(URL_RESOLUCIONES)
-df_tesauros = descargar_y_leer_excel(URL_TESAUROS)
+# Carga en memoria al encender el servidor
+df_resoluciones = cargar_resoluciones_local(PATH_RESOLUCIONES)
+df_tesauros = cargar_tesauros_local(PATH_TESAUROS)
 
 
-# --- Endpoints de Estado y Recarga ---
 @app.get("/", tags=["Estado"])
 def inicio():
     return {
-        "servicio": "Nexus-BOT Knowledge Server",
+        "servicio": "Nexus-BOT Knowledge Server (Local Storage)",
         "estado": "En línea y operativo",
-        "url_origen": URL_RESOLUCIONES,
+        "archivo_encontrado": os.path.exists(PATH_RESOLUCIONES),
         "registros_cargados": {
             "resoluciones": len(df_resoluciones),
             "tesauros": len(df_tesauros)
@@ -104,21 +91,6 @@ def inicio():
     }
 
 
-@app.post("/api/recargar-datos", tags=["Mantenimiento"])
-def recargar_datos():
-    """Vuelve a leer los archivos Excel desde cij.poder-judicial.go.cr sin reiniciar el servidor."""
-    global df_resoluciones, df_tesauros
-    df_resoluciones = cargar_resoluciones_desde_url(URL_RESOLUCIONES)
-    df_tesauros = descargar_y_leer_excel(URL_TESAUROS)
-    
-    return {
-        "mensaje": "Bases de datos actualizadas correctamente",
-        "resoluciones_activas": len(df_resoluciones),
-        "tesauros_activos": len(df_tesauros)
-    }
-
-
-# --- Herramienta 1: Búsqueda Jurisprudencial ---
 @app.get("/api/buscar-jurisprudencia", tags=["Herramientas Jurisprudenciales"])
 def buscar_jurisprudencia(
     termino: str = Query(..., description="Término clave, tema, subtema, abogado, voto o expediente"),
@@ -129,16 +101,15 @@ def buscar_jurisprudencia(
         return {
             "total_encontrados": 0,
             "resultados": [],
-            "aviso": f"No se pudieron cargar datos desde {URL_RESOLUCIONES}. Verifica que el archivo exista en esa ruta."
+            "aviso": "No se encontró el archivo 'resoluciones.xlsx' junto a server.py en el repositorio."
         }
 
     termino_norm = termino.lower().strip()
     resultados = []
 
-    # Búsqueda vectorizada rápida en Pandas (ideal para archivos grandes)
     mask = pd.Series(False, index=df_resoluciones.index)
     campos_busqueda = ["tema", "subtema", "abogado", "numero_voto", "despacho", "no_expediente"]
-    
+
     for campo in campos_busqueda:
         if campo in df_resoluciones.columns:
             mask = mask | df_resoluciones[campo].astype(str).str.lower().str.contains(termino_norm, regex=False)
@@ -167,13 +138,12 @@ def buscar_jurisprudencia(
     }
 
 
-# --- Herramienta 2: Consulta de Tesauro Jurídico ---
 @app.get("/api/consultar-tesauro", tags=["Herramientas Jurisprudenciales"])
 def consultar_tesauro(
     concepto: str = Query(..., description="Concepto o figura jurídica a normalizar")
 ):
     if df_tesauros.empty:
-        return {"coincidencias": [{"mensaje": "No hay archivo de tesauros cargado en /files/BI/."}]}
+        return {"coincidencias": [{"mensaje": "No se encontró el archivo 'tesauros.xlsx' en el repositorio."}]}
 
     concepto_norm = concepto.lower().strip()
     coincidencias = []
@@ -193,7 +163,6 @@ def consultar_tesauro(
     }
 
 
-# --- Declaración del Manifiesto MCP / Herramientas ---
 @app.get("/mcp/tools", tags=["MCP Tools"])
 def obtener_herramientas_disponibles():
     return {

@@ -215,9 +215,8 @@ def consultar_tesauro_mcp(
     return ejecutar_consulta_tesauro(concepto=concepto, materia=materia, limite=limite)
 
 
-# ==============================================================================
-# APLICACIÓN FASTAPI + MONTAJE DEL ENDPOINT /mcp
-# ==============================================================================
+mcp_app = mcp.streamable_http_app()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with mcp.session_manager.run():
@@ -321,4 +320,4 @@ def obtener_herramientas_disponibles():
 
 
 # Monta la app oficial de MCP al final para exponer exactamente la ruta /mcp sin redirecciones 307
-app.mount("/", mcp.streamable_http_app())
+app.mount("/", mcp_app)

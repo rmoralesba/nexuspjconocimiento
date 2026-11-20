@@ -8,6 +8,7 @@ from typing import Optional
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "nexus_knowledge.db")
@@ -185,7 +186,10 @@ def ejecutar_consulta_tesauro(
 mcp = FastMCP(
     "Nexus-BOT Knowledge Server",
     stateless_http=True,
-    json_response=True
+    json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False
+    )
 )
 
 

@@ -1,15 +1,19 @@
 import os
+import gc
 import glob
+import sqlite3
+import tempfile
 import traceback
+import unicodedata
 import pandas as pd
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(
     title="Nexus-BOT API & MCP Server",
     description="Servidor de herramientas jurisprudenciales y tesauros multidisciplinares",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -23,72 +27,166 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "datos")
 PATH_RESOLUCIONES = os.path.join(DATA_DIR, "Reporte Temas Subtemas Analizados.xlsx")
+DB_PATH = os.path.join(tempfile.gettempdir(), "nexus_knowledge.db")
 
-ERROR_CARGA_RESOLUCIONES = None
+ERROR_CARGA_RESOLUCIONES: Optional[str] = None
 ARCHIVOS_TESAUROS_CARGADOS: List[str] = []
+TOTAL_RESOLUCIONES_CARGADAS: int = 0
+TOTAL_TESAUROS_CARGADOS: int = 0
 
 
-def cargar_resoluciones_local(ruta: str) -> pd.DataFrame:
-    """Lee la primera hoja del Excel de resoluciones de forma segura."""
+def normalizar_texto(texto: object) -> str:
+    """Convierte a minúsculas, elimina tildes y espacios sobrantes para búsquedas rápidas."""
+    if texto is None or (isinstance(texto, float) and pd.isna(texto)):
+        return ""
+    s = str(texto).strip().lower()
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s)
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def limpiar_valor(val: object) -> str:
+    """Garantiza un string limpio sin valores NaN/NaT ni estructuras de Pandas."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "N/D"
+    if isinstance(val, pd.Timestamp):
+        return val.strftime("%Y-%m-%d")
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "nat", "none"):
+        return "N/D"
+    return s
+
+
+def inicializar_db() -> sqlite3.Connection:
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE resoluciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            numero_voto TEXT,
+            no_expediente TEXT,
+            fecha_voto TEXT,
+            despacho TEXT,
+            abogado TEXT,
+            tema TEXT,
+            subtema TEXT,
+            despacho_norm TEXT,
+            texto_busqueda TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE tesauros (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            materia_primer_nivel TEXT,
+            categoria_segundo_nivel TEXT,
+            descriptor_tercer_nivel TEXT,
+            archivo_origen TEXT,
+            materia_norm TEXT,
+            archivo_norm TEXT,
+            texto_busqueda TEXT
+        )
+    """)
+    cur.execute("CREATE INDEX idx_res_despacho ON resoluciones(despacho_norm)")
+    cur.execute("CREATE INDEX idx_tes_materia ON tesauros(materia_norm)")
+    conn.commit()
+    return conn
+
+
+def cargar_resoluciones_a_sqlite(conn: sqlite3.Connection, ruta: str) -> int:
+    """Lee el Excel de resoluciones, corrige el mapeo de columnas y lo vuelca a SQLite."""
     global ERROR_CARGA_RESOLUCIONES
     if not os.path.exists(ruta):
         ERROR_CARGA_RESOLUCIONES = f"El archivo no existe en: {ruta}"
-        return pd.DataFrame()
-    
+        return 0
+
     try:
         df = pd.read_excel(ruta, sheet_name=0, engine="openpyxl")
-        df = df.fillna("")
 
+        # Mapeo seguro: evaluar 'fecha' ANTES que 'voto' y evitar columnas duplicadas
         mapeo_columnas = {}
+        destinos_usados = set()
+
         for col in df.columns:
-            col_limpia = (
-                str(col).strip().lower()
-                .replace("á", "a").replace("é", "e")
-                .replace("í", "i").replace("ó", "o").replace("ú", "u")
-            )
-            if "abogado" in col_limpia:
-                mapeo_columnas[col] = "abogado"
-            elif "tema" in col_limpia and "sub" not in col_limpia:
-                mapeo_columnas[col] = "tema"
+            col_limpia = normalizar_texto(col)
+            destino = None
+
+            if "fecha" in col_limpia:
+                destino = "fecha_voto"
+            elif "abogado" in col_limpia:
+                destino = "abogado"
             elif "subtema" in col_limpia:
-                mapeo_columnas[col] = "subtema"
-            elif "voto" in col_limpia or "resolucion" in col_limpia or "sentencia" in col_limpia:
-                mapeo_columnas[col] = "numero_voto"
-            elif "fecha" in col_limpia:
-                mapeo_columnas[col] = "fecha_voto"
-            elif "despacho" in col_limpia:
-                mapeo_columnas[col] = "despacho"
+                destino = "subtema"
+            elif "tema" in col_limpia:
+                destino = "tema"
             elif "expediente" in col_limpia:
-                mapeo_columnas[col] = "no_expediente"
+                destino = "no_expediente"
+            elif "despacho" in col_limpia:
+                destino = "despacho"
+            elif "voto" in col_limpia or "resolucion" in col_limpia or "sentencia" in col_limpia:
+                destino = "numero_voto"
+
+            if destino and destino not in destinos_usados:
+                mapeo_columnas[col] = destino
+                destinos_usados.add(destino)
 
         df = df.rename(columns=mapeo_columnas)
-        
-        columnas_utiles = [
-            c for c in ["abogado", "tema", "subtema", "numero_voto", "fecha_voto", "despacho", "no_expediente"]
-            if c in df.columns
+
+        columnas_esperadas = [
+            "numero_voto", "no_expediente", "fecha_voto",
+            "despacho", "abogado", "tema", "subtema"
         ]
-        if columnas_utiles:
-            df = df[columnas_utiles]
-            
-        return df
+        for c in columnas_esperadas:
+            if c not in df.columns:
+                df[c] = "N/D"
+
+        df = df[columnas_esperadas].drop_duplicates()
+
+        filas_insertar = []
+        for row in df.itertuples(index=False):
+            num_voto = limpiar_valor(row.numero_voto)
+            no_exp = limpiar_valor(row.no_expediente)
+            fecha = limpiar_valor(row.fecha_voto)
+            desp = limpiar_valor(row.despacho)
+            abog = limpiar_valor(row.abogado)
+            tema = limpiar_valor(row.tema)
+            subtema = limpiar_valor(row.subtema)
+
+            texto_busq = normalizar_texto(f"{num_voto} {no_exp} {fecha} {desp} {abog} {tema} {subtema}")
+            filas_insertar.append((
+                num_voto, no_exp, fecha, desp, abog, tema, subtema,
+                normalizar_texto(desp), texto_busq
+            ))
+
+        conn.executemany("""
+            INSERT INTO resoluciones (
+                numero_voto, no_expediente, fecha_voto, despacho, abogado,
+                tema, subtema, despacho_norm, texto_busqueda
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, filas_insertar)
+        conn.commit()
+
+        total = len(filas_insertar)
+        del df, filas_insertar
+        gc.collect()
+        return total
+
     except Exception as e:
         ERROR_CARGA_RESOLUCIONES = f"Error al leer Excel de resoluciones: {str(e)}"
-        return pd.DataFrame()
+        return 0
 
 
-def cargar_todos_los_tesauros(carpeta_datos: str) -> List[Dict[str, str]]:
-    """
-    Busca automáticamente TODOS los archivos Excel de tesauros en la carpeta 'datos/'
-    y reconstruye su jerarquía (Primer Nivel -> Segundo Nivel -> Tercer Nivel).
-    """
+def cargar_tesauros_a_sqlite(conn: sqlite3.Connection, carpeta_datos: str) -> int:
+    """Carga los archivos Excel de tesauros a SQLite y libera la memoria de cada archivo."""
     global ARCHIVOS_TESAUROS_CARGADOS
     ARCHIVOS_TESAUROS_CARGADOS = []
-    registros_unificados: List[Dict[str, str]] = []
+    total_insertados = 0
 
     if not os.path.exists(carpeta_datos):
-        return registros_unificados
+        return 0
 
-    # Buscar cualquier .xlsx en datos/ que contenga 'tesauro' en su nombre
     todos_xlsx = glob.glob(os.path.join(carpeta_datos, "*.xlsx"))
     archivos_tesauro = [f for f in todos_xlsx if "tesauro" in os.path.basename(f).lower()]
 
@@ -96,11 +194,10 @@ def cargar_todos_los_tesauros(carpeta_datos: str) -> List[Dict[str, str]]:
         nombre_archivo = os.path.basename(ruta_archivo)
         try:
             df = pd.read_excel(ruta_archivo, sheet_name=0, engine="openpyxl")
-            
-            # Identificar columnas de nivel sin importar espacios o mayúsculas
+
             col_l1, col_l2, col_l3 = None, None, None
             for col in df.columns:
-                c_norm = str(col).strip().lower()
+                c_norm = normalizar_texto(col)
                 if "primer" in c_norm:
                     col_l1 = col
                 elif "segundo" in c_norm:
@@ -108,51 +205,62 @@ def cargar_todos_los_tesauros(carpeta_datos: str) -> List[Dict[str, str]]:
                 elif "tercer" in c_norm:
                     col_l3 = col
 
-            # Materia por defecto derivada del nombre del archivo (ej. TESAURO-AGRARIO.xlsx -> AGRARIO)
             materia_default = (
                 nombre_archivo.replace(".xlsx", "")
                 .replace("TESAURO-", "").replace("tesauro-", "")
                 .replace("_", " ").strip().title()
             )
-            
+
             nivel_1_actual = materia_default
             nivel_2_actual = "General"
+            lote = []
 
             for _, fila in df.iterrows():
                 if col_l1 and pd.notna(fila[col_l1]) and str(fila[col_l1]).strip():
                     nivel_1_actual = str(fila[col_l1]).strip()
-                    nivel_2_actual = "General"  # Reiniciar nivel 2 al cambiar de materia principal
-                
+                    nivel_2_actual = "General"
+
                 if col_l2 and pd.notna(fila[col_l2]) and str(fila[col_l2]).strip():
                     nivel_2_actual = str(fila[col_l2]).strip()
-                
+
+                termino_l3 = None
                 if col_l3 and pd.notna(fila[col_l3]) and str(fila[col_l3]).strip():
                     termino_l3 = str(fila[col_l3]).strip()
-                    registros_unificados.append({
-                        "materia_primer_nivel": nivel_1_actual,
-                        "categoria_segundo_nivel": nivel_2_actual,
-                        "descriptor_tercer_nivel": termino_l3,
-                        "archivo_origen": nombre_archivo
-                    })
-                elif (col_l2 and pd.notna(fila[col_l2]) and str(fila[col_l2]).strip()) and not col_l3:
-                    # Caso en que el archivo solo tenga hasta segundo nivel
-                    registros_unificados.append({
-                        "materia_primer_nivel": nivel_1_actual,
-                        "categoria_segundo_nivel": nivel_2_actual,
-                        "descriptor_tercer_nivel": nivel_2_actual,
-                        "archivo_origen": nombre_archivo
-                    })
+                elif col_l2 and pd.notna(fila[col_l2]) and str(fila[col_l2]).strip() and not col_l3:
+                    termino_l3 = nivel_2_actual
+
+                if termino_l3:
+                    texto_busq = normalizar_texto(f"{nivel_1_actual} {nivel_2_actual} {termino_l3}")
+                    lote.append((
+                        nivel_1_actual, nivel_2_actual, termino_l3, nombre_archivo,
+                        normalizar_texto(nivel_1_actual), normalizar_texto(nombre_archivo), texto_busq
+                    ))
+
+            if lote:
+                conn.executemany("""
+                    INSERT INTO tesauros (
+                        materia_primer_nivel, categoria_segundo_nivel, descriptor_tercer_nivel,
+                        archivo_origen, materia_norm, archivo_norm, texto_busqueda
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, lote)
+                conn.commit()
+                total_insertados += len(lote)
 
             ARCHIVOS_TESAUROS_CARGADOS.append(nombre_archivo)
+            del df, lote
+            gc.collect()
         except Exception as e:
             print(f"Error cargando tesauro {nombre_archivo}: {e}")
 
-    return registros_unificados
+    return total_insertados
 
 
-# Carga en memoria al iniciar el servidor
-df_resoluciones = cargar_resoluciones_local(PATH_RESOLUCIONES)
-lista_tesauros = cargar_todos_los_tesauros(DATA_DIR)
+# Inicialización al arrancar el servidor
+_conn_init = inicializar_db()
+TOTAL_RESOLUCIONES_CARGADAS = cargar_resoluciones_a_sqlite(_conn_init, PATH_RESOLUCIONES)
+TOTAL_TESAUROS_CARGADOS = cargar_tesauros_a_sqlite(_conn_init, DATA_DIR)
+_conn_init.close()
+gc.collect()
 
 
 # --- Endpoint de Estado ---
@@ -161,14 +269,15 @@ def inicio():
     return {
         "servicio": "Nexus-BOT Knowledge Server",
         "estado": "En línea y operativo",
+        "motor_consulta": "SQLite (bajo consumo de RAM)",
         "resoluciones": {
-            "cargadas": len(df_resoluciones),
+            "cargadas": TOTAL_RESOLUCIONES_CARGADAS,
             "error": ERROR_CARGA_RESOLUCIONES
         },
         "tesauros": {
             "archivos_detectados": len(ARCHIVOS_TESAUROS_CARGADOS),
             "lista_archivos": ARCHIVOS_TESAUROS_CARGADOS,
-            "total_descriptores_indexados": len(lista_tesauros)
+            "total_descriptores_indexados": TOTAL_TESAUROS_CARGADOS
         }
     }
 
@@ -178,44 +287,67 @@ def inicio():
 def buscar_jurisprudencia(
     termino: str = Query(..., description="Término clave, tema, subtema, abogado, voto o expediente"),
     despacho: Optional[str] = Query(None, description="Filtrar por despacho judicial"),
-    limite: int = Query(5, description="Cantidad máxima de resoluciones a devolver")
+    limite: int = Query(5, ge=1, le=5000, description="Cantidad máxima de registros a devolver")
 ):
     try:
-        if df_resoluciones.empty:
+        if TOTAL_RESOLUCIONES_CARGADAS == 0:
             return {
                 "total_encontrados": 0,
+                "total_resoluciones_distintas": 0,
                 "resultados": [],
                 "detalle_error": ERROR_CARGA_RESOLUCIONES or "La tabla de resoluciones está vacía."
             }
 
-        termino_norm = termino.lower().strip()
-        resultados = []
+        termino_norm = normalizar_texto(termino)
+        params = [f"%{termino_norm}%"]
+        where_clause = "texto_busqueda LIKE ?"
 
-        for _, fila in df_resoluciones.iterrows():
-            texto_fila = " ".join(str(val) for val in fila.values).lower()
-            
-            if termino_norm in texto_fila:
-                despacho_val = str(fila.get("despacho", "N/D"))
-                if despacho and despacho.lower().strip() not in despacho_val.lower():
-                    continue
-                    
-                resultados.append({
-                    "numero_voto": str(fila.get("numero_voto", "N/D")),
-                    "numero_expediente": str(fila.get("no_expediente", "N/D")),
-                    "fecha_voto": str(fila.get("fecha_voto", "N/D")),
-                    "despacho": despacho_val,
-                    "abogado": str(fila.get("abogado", "N/D")),
-                    "tema": str(fila.get("tema", "N/D")),
-                    "subtema": str(fila.get("subtema", "N/D"))
-                })
-                
-                if len(resultados) >= limite:
-                    break
+        if despacho and despacho.strip():
+            where_clause += " AND despacho_norm LIKE ?"
+            params.append(f"%{normalizar_texto(despacho)}%")
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            # Conteo exacto de registros y resoluciones distintas antes del LIMIT
+            cur.execute(
+                f"SELECT COUNT(*) AS total, COUNT(DISTINCT numero_voto || '|' || no_expediente) AS distintas "
+                f"FROM resoluciones WHERE {where_clause}",
+                params
+            )
+            stats = cur.fetchone()
+
+            cur.execute(
+                f"""
+                SELECT numero_voto, no_expediente, fecha_voto, despacho, abogado, tema, subtema
+                FROM resoluciones
+                WHERE {where_clause}
+                LIMIT ?
+                """,
+                params + [limite]
+            )
+            filas = cur.fetchall()
+
+        resultados = [
+            {
+                "numero_voto": f["numero_voto"],
+                "numero_expediente": f["no_expediente"],
+                "fecha_voto": f["fecha_voto"],
+                "despacho": f["despacho"],
+                "abogado": f["abogado"],
+                "tema": f["tema"],
+                "subtema": f["subtema"]
+            }
+            for f in filas
+        ]
 
         return {
             "termino_buscado": termino,
             "despacho_filtrado": despacho,
-            "total_encontrados": len(resultados),
+            "total_registros_coincidentes": stats["total"],
+            "total_resoluciones_distintas": stats["distintas"],
+            "total_devueltos": len(resultados),
             "resultados": resultados
         }
     except Exception as e:
@@ -230,31 +362,39 @@ def buscar_jurisprudencia(
 def consultar_tesauro(
     concepto: str = Query(..., description="Concepto o figura jurídica a buscar en todos los tesauros"),
     materia: Optional[str] = Query(None, description="Filtrar por materia (ej. Agrario, Civil, Penal, Disciplinario)"),
-    limite: int = Query(15, description="Cantidad máxima de descriptores a devolver")
+    limite: int = Query(15, ge=1, le=500, description="Cantidad máxima de descriptores a devolver")
 ):
-    """
-    Busca términos en todos los archivos Excel de tesauro cargados en 'datos/'.
-    """
-    if not lista_tesauros:
+    if TOTAL_TESAUROS_CARGADOS == 0:
         return {
             "concepto_consultado": concepto,
             "coincidencias": [],
             "aviso": "No se encontraron archivos Excel con 'TESAURO' en el nombre dentro de la carpeta 'datos/'."
         }
 
-    concepto_norm = concepto.lower().strip()
-    coincidencias = []
+    concepto_norm = normalizar_texto(concepto)
+    params = [f"%{concepto_norm}%"]
+    where_clause = "texto_busqueda LIKE ?"
 
-    for item in lista_tesauros:
-        texto_completo = f"{item['materia_primer_nivel']} {item['categoria_segundo_nivel']} {item['descriptor_tercer_nivel']}".lower()
-        
-        if concepto_norm in texto_completo:
-            if materia and materia.lower().strip() not in item["materia_primer_nivel"].lower() and materia.lower().strip() not in item["archivo_origen"].lower():
-                continue
-            
-            coincidencias.append(item)
-            if len(coincidencias) >= limite:
-                break
+    if materia and materia.strip():
+        mat_norm = f"%{normalizar_texto(materia)}%"
+        where_clause += " AND (materia_norm LIKE ? OR archivo_norm LIKE ?)"
+        params.extend([mat_norm, mat_norm])
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT materia_primer_nivel, categoria_segundo_nivel, descriptor_tercer_nivel, archivo_origen
+            FROM tesauros
+            WHERE {where_clause}
+            LIMIT ?
+            """,
+            params + [limite]
+        )
+        filas = cur.fetchall()
+
+    coincidencias = [dict(f) for f in filas]
 
     return {
         "concepto_consultado": concepto,
